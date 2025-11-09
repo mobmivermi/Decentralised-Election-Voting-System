@@ -9,6 +9,9 @@
 (define-constant err-invalid-candidate (err u107))
 (define-constant err-election-not-started (err u108))
 (define-constant err-election-ended (err u109))
+(define-constant err-self-delegation (err u110))
+(define-constant err-delegation-exists (err u111))
+(define-constant err-no-delegation (err u112))
 
 (define-data-var next-election-id uint u1)
 
@@ -63,6 +66,25 @@
     { is-registered: bool }
 )
 
+(define-map delegations
+    {
+        election-id: uint,
+        delegator: principal,
+    }
+    {
+        delegate: principal,
+        block-height: uint,
+    }
+)
+
+(define-map delegation-vote-count
+    {
+        election-id: uint,
+        delegate: principal,
+    }
+    { count: uint }
+)
+
 (define-read-only (get-contract-owner)
     contract-owner
 )
@@ -104,6 +126,29 @@
             (map-get? voter-registrations {
                 election-id: election-id,
                 voter: voter,
+            })
+        ))
+)
+
+(define-read-only (get-delegation
+        (election-id uint)
+        (delegator principal)
+    )
+    (map-get? delegations {
+        election-id: election-id,
+        delegator: delegator,
+    })
+)
+
+(define-read-only (get-delegation-count
+        (election-id uint)
+        (delegate principal)
+    )
+    (default-to u0
+        (get count
+            (map-get? delegation-vote-count {
+                election-id: election-id,
+                delegate: delegate,
             })
         ))
 )
@@ -313,6 +358,113 @@
             candidate-id: candidate-id,
         }
             (merge candidate-data { is-active: false })
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (delegate-vote
+        (election-id uint)
+        (delegate principal)
+    )
+    (let (
+            (election-data (unwrap! (get-election election-id) err-not-found))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-election-active election-id) err-voting-closed)
+        (asserts! (get-voter-registration election-id tx-sender) err-unauthorized)
+        (asserts! (not (has-voted election-id tx-sender)) err-already-voted)
+        (asserts! (not (is-eq tx-sender delegate)) err-self-delegation)
+        (asserts! (is-none (get-delegation election-id tx-sender))
+            err-delegation-exists
+        )
+        (asserts! (get-voter-registration election-id delegate) err-unauthorized)
+
+        (map-set delegations {
+            election-id: election-id,
+            delegator: tx-sender,
+        } {
+            delegate: delegate,
+            block-height: current-block,
+        })
+
+        (let ((current-count (get-delegation-count election-id delegate)))
+            (map-set delegation-vote-count {
+                election-id: election-id,
+                delegate: delegate,
+            } { count: (+ current-count u1) }
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (revoke-delegation (election-id uint))
+    (let (
+            (election-data (unwrap! (get-election election-id) err-not-found))
+            (delegation-data (unwrap! (get-delegation election-id tx-sender) err-no-delegation))
+            (delegate (get delegate delegation-data))
+        )
+        (asserts! (is-election-active election-id) err-voting-closed)
+        (asserts! (not (has-voted election-id tx-sender)) err-already-voted)
+
+        (map-delete delegations {
+            election-id: election-id,
+            delegator: tx-sender,
+        })
+
+        (let ((current-count (get-delegation-count election-id delegate)))
+            (map-set delegation-vote-count {
+                election-id: election-id,
+                delegate: delegate,
+            } { count: (- current-count u1) }
+            )
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (cast-delegated-vote
+        (election-id uint)
+        (candidate-id uint)
+        (delegator principal)
+    )
+    (let (
+            (election-data (unwrap! (get-election election-id) err-not-found))
+            (candidate-data (unwrap! (get-candidate election-id candidate-id)
+                err-invalid-candidate
+            ))
+            (delegation-data (unwrap! (get-delegation election-id delegator) err-no-delegation))
+            (current-block stacks-block-height)
+        )
+        (asserts! (is-election-active election-id) err-voting-closed)
+        (asserts! (is-eq (get delegate delegation-data) tx-sender)
+            err-unauthorized
+        )
+        (asserts! (not (has-voted election-id delegator)) err-already-voted)
+        (asserts! (get is-active candidate-data) err-invalid-candidate)
+
+        (map-set votes {
+            election-id: election-id,
+            voter: delegator,
+        } {
+            candidate-id: candidate-id,
+            block-height: current-block,
+            timestamp: current-block,
+        })
+
+        (map-set candidates {
+            election-id: election-id,
+            candidate-id: candidate-id,
+        }
+            (merge candidate-data { vote-count: (+ (get vote-count candidate-data) u1) })
+        )
+
+        (map-set elections { election-id: election-id }
+            (merge election-data { total-votes: (+ (get total-votes election-data) u1) })
         )
 
         (ok true)
